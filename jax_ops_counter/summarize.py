@@ -93,6 +93,31 @@ def sum_params(params_dict):
         all_params += np.prod(v.shape)
     return all_params
 
+def conv_handler(call_data,variables, all_paths):
+    def unpack_call(call_data):
+        inputs = call_data.args
+        assert len(inputs) == 1, "dense layers only one arg only supports one input"
+        conv_input = inputs[0]
+        conv_output = call_data.outputs
+
+        ishape = conv_input.shape
+        dtype = conv_input.dtype
+        oshape = conv_output.shape
+        this_module, child_modules = get_module_variables(call_data.path, variables, all_paths)
+        params_dict = this_module['params']
+        all_params = sum_params(params_dict)
+        kernel = params_dict['kernel'].shape
+        return all_params, ishape, oshape, dtype, kernel
+
+
+    all_params, ishape, oshape, dtype, kernel_shape = unpack_call(call_data) 
+    macs = np.prod(kernel_shape) * np.prod(oshape[1:3])
+    macs_per_output = np.prod(kernel_shape)
+    total_loads = all_params + macs 
+
+    return macs, all_params, macs_per_output, total_loads 
+
+
 def fc_handler(call_data,variables, all_paths):
     def unpack_call(call_data):
         inputs = call_data.args
@@ -107,6 +132,11 @@ def fc_handler(call_data,variables, all_paths):
         all_params = sum_params(params_dict)
         return all_params, ishape, oshape, dtype
     all_params, ishape, oshape, dtype = unpack_call(call_data)
+    #input channels, output channels, output shape, kernel size
+    macs = ishape[-1] * np.prod(oshape[1:])
+    macs_per_output = ishape[-1] 
+    total_loads = all_params +  macs
+    return macs, all_params, macs_per_output, total_loads 
 
     batch_size = ishape[0]
     assert batch_size == oshape[0], "misinterpretation of shapes {} {}".format(ishape, oshape)
@@ -120,12 +150,13 @@ def fc_handler(call_data,variables, all_paths):
         outer_repititions = np.prod(oshape[1:-1])
     macs = outer_repititions * params
     macs_per_output = ishape[-1] 
-    total_loads = 2 * macs
+    total_loads = all_params + macs
     return macs, all_params, macs_per_output, total_loads 
 
 def module_handler(module_type):
     module_handler = {}
     module_handler[nn.Dense] = fc_handler
+    module_handler[nn.Conv] = conv_handler
     if module_type in module_handler.keys():
         return module_handler[module_type]
     return None
@@ -173,19 +204,28 @@ def get_model_stats(model, *model_args):
     #calls contains the ordered calls for the network
     all_paths: Set[Tuple[str, ...]] = set(call.path for call in calls)
     all_data = []
+    def safe_shape(x):
+        try:
+            return x.shape
+        except:
+            return ()
     for call in calls:
         handler = module_handler(call.module_type)
         if isinstance(call.outputs, tuple):
-            outputs = [x.shape for x in flatten(call.outputs)]
+            outputs = [safe_shape(x) for x in flatten(call.outputs)]
         else:
-            outputs = [call.outputs.shape]
+            outputs = [safe_shape(call.outputs)]
         if handler is None:
             #check to make sure that the module is not a leaf
             macs, all_params, macs_per_output, total_loads = [0] * 4
         else:
             macs, all_params, macs_per_output, total_loads = handler(call, variables,all_paths)
-
-        row = LayerData(call.path, call.module_type, [x.shape for x in flatten(call.args)],\
+        def sanitized_shape(x):
+            try:
+                return x.shape
+            except:
+                return None
+        row = LayerData(call.path, call.module_type, [sanitized_shape(x) for x in flatten(call.args)],\
                 outputs, macs, all_params, macs_per_output, total_loads)
 
 
@@ -233,8 +273,6 @@ def get_model_stats(model, *model_args):
             #no children assume values have already been computed 
             return
         summable_values = base_layer.get_summable_values()
-#        if base_name == 'GRURNN_0':
-#            import pdb; pdb.set_trace()
         for layer in child_layers:
             #sum the values
             summable_values = [x + y for x,y in zip(summable_values, layer.get_summable_values())]
